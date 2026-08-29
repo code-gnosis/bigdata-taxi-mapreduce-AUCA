@@ -1,0 +1,200 @@
+# =============================================================================
+# BIG DATA ESSENTIAL -- INDIVIDUAL ASSIGNMENT
+# Distributed Taxi Trip Analytics Using Apache Hadoop, HDFS and Python MapReduce
+#
+# Every command needed to reproduce the work, in order.
+# Environment: macOS 26.5.2 (Tahoe), Apple M4, Hadoop 3.5.0, OpenJDK 17.0.20, Python 3.14
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 0. WHY THE PROJECT LIVES IN ~/taxi_project AND NOT IN THE COURSE FOLDER
+# -----------------------------------------------------------------------------
+# Hadoop parses the arguments of -files / -file as URIs. A space anywhere in the path
+# raises java.net.URISyntaxException: Illegal character in path. The course folder path
+# contains spaces, so all jobs are launched from a space-free working directory.
+
+# -----------------------------------------------------------------------------
+# 1. ENVIRONMENT
+# -----------------------------------------------------------------------------
+export HADOOP_HOME=/opt/homebrew/opt/hadoop/libexec
+export JAVA_HOME=$(/usr/libexec/java_home -v 17)
+export PATH=$HADOOP_HOME/bin:$HADOOP_HOME/sbin:$PATH
+export STREAM_JAR=$(ls $HADOOP_HOME/share/hadoop/tools/lib/hadoop-streaming-*.jar)
+
+# HDFS storage was moved off /tmp (which macOS periodically clears, destroying the
+# NameNode metadata) to a persistent location. See core-site.xml:
+#   fs.defaultFS   = hdfs://localhost:8020
+#   hadoop.tmp.dir = /Users/thierrys/hadoop-data
+
+hdfs namenode -format          # first-time initialisation only
+start-dfs.sh
+start-yarn.sh
+jps                            # expect: NameNode DataNode SecondaryNameNode ResourceManager NodeManager
+
+# -----------------------------------------------------------------------------
+# 2. DATA ACQUISITION  (NYC TLC official trip records)
+# -----------------------------------------------------------------------------
+for m in 2024-01 2024-02 2024-03; do
+  curl -o data/raw_parquet/yellow_tripdata_${m}.parquet \
+    "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_${m}.parquet"
+done
+curl -o data/taxi_zone_lookup.csv \
+  "https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv"
+
+# 3 monthly files = 9,554,778 trip records (requirement: 2-3 months OR 5M records)
+
+# -----------------------------------------------------------------------------
+# 3. PARQUET -> CSV CONVERSION
+# -----------------------------------------------------------------------------
+# TLC ships Parquet (columnar, compressed, schema-embedded) -- excellent for storage.
+# Hadoop Streaming feeds mappers raw LINES on stdin and cannot read Parquet, so the
+# data is flattened to CSV first. Cost: 153 MB Parquet -> 1.02 GB CSV (~6.7x).
+python3 scripts/convert_parquet_to_csv.py
+
+# -----------------------------------------------------------------------------
+# 4. HDFS DIRECTORY STRUCTURE
+# -----------------------------------------------------------------------------
+hdfs dfs -mkdir -p /taxi_project/input/raw
+hdfs dfs -mkdir -p /taxi_project/input/cleaned
+hdfs dfs -mkdir -p /taxi_project/output/hourly
+hdfs dfs -mkdir -p /taxi_project/output/locations
+hdfs dfs -mkdir -p /taxi_project/output/revenue
+hdfs dfs -mkdir -p /taxi_project/output/payment
+hdfs dfs -mkdir -p /taxi_project/output/routes
+hdfs dfs -mkdir -p /taxi_project/output/anomalies
+hdfs dfs -mkdir -p /taxi_project/archive
+
+hdfs dfs -ls -R /taxi_project
+
+# NOTE: MapReduce REFUSES to write into an existing output directory (a deliberate
+# guard against silently destroying previous results). The output leaves created above
+# are therefore removed immediately before each job runs -- see run_all_jobs.sh.
+
+# -----------------------------------------------------------------------------
+# 5. UPLOAD TO HDFS
+# -----------------------------------------------------------------------------
+hdfs dfs -put data/csv/yellow_tripdata_*.csv /taxi_project/input/raw/
+hdfs dfs -ls -h /taxi_project/input/raw/
+hdfs dfs -du -h /taxi_project/input/raw/
+hdfs dfsadmin -report
+hdfs fsck /taxi_project/input/raw -files -blocks       # block-level layout evidence
+
+# -----------------------------------------------------------------------------
+# 6. STAGE 1 -- CLEANING AND DE-DUPLICATION  (raw -> cleaned)
+# -----------------------------------------------------------------------------
+hdfs dfs -rm -r -skipTrash /taxi_project/input/cleaned
+hadoop jar $STREAM_JAR \
+  -files mappers/mapper_clean.py,reducers/reducer_clean.py \
+  -input  /taxi_project/input/raw \
+  -output /taxi_project/input/cleaned \
+  -mapper mapper_clean.py \
+  -reducer reducer_clean.py \
+  -numReduceTasks 4
+
+# Rejection statistics are emitted as Hadoop counters from inside the mapper using
+#   reporter:counter:Cleaning,<rule>,1     (written to stderr; stdout is reserved for data)
+# and appear in the job summary under the "Cleaning" counter group.
+
+# -----------------------------------------------------------------------------
+# 7. THE EIGHT REQUIRED ANALYSES
+# -----------------------------------------------------------------------------
+# General form (see run_all_jobs.sh for the full sequence):
+#
+#   hadoop jar $STREAM_JAR \
+#     -files mappers/mapper_X.py,reducers/reducer_X.py \
+#     -input  /taxi_project/input/cleaned \
+#     -output /taxi_project/output/X \
+#     -mapper mapper_X.py -reducer reducer_X.py -numReduceTasks N
+
+# (a) Hourly demand
+hadoop jar $STREAM_JAR -files mappers/mapper_hourly.py,reducers/reducer_hourly.py \
+  -input /taxi_project/input/cleaned -output /taxi_project/output/hourly \
+  -mapper mapper_hourly.py -reducer reducer_hourly.py -numReduceTasks 1
+
+# (b) Daily demand / weekday vs weekend
+hadoop jar $STREAM_JAR -files mappers/mapper_daily.py,reducers/reducer_daily.py \
+  -input /taxi_project/input/cleaned -output /taxi_project/output/daily \
+  -mapper mapper_daily.py -reducer reducer_daily.py -numReduceTasks 1
+
+# (c) Pickup location counts
+hadoop jar $STREAM_JAR -files mappers/mapper_location.py,reducers/reducer_location.py \
+  -input /taxi_project/input/cleaned -output /taxi_project/output/locations \
+  -mapper mapper_location.py -reducer reducer_location.py -numReduceTasks 1
+
+# (d) Revenue by pickup zone      <-- STAGE 1 of the multi-stage workflow
+hadoop jar $STREAM_JAR -files mappers/mapper_revenue.py,reducers/reducer_revenue.py \
+  -input /taxi_project/input/cleaned -output /taxi_project/output/revenue \
+  -mapper mapper_revenue.py -reducer reducer_revenue.py -numReduceTasks 1
+
+# (e) Payment method
+hadoop jar $STREAM_JAR -files mappers/mapper_payment.py,reducers/reducer_payment.py \
+  -input /taxi_project/input/cleaned -output /taxi_project/output/payment \
+  -mapper mapper_payment.py -reducer reducer_payment.py -numReduceTasks 1
+
+# (f) Distance bands
+hadoop jar $STREAM_JAR -files mappers/mapper_distance.py,reducers/reducer_distance.py \
+  -input /taxi_project/input/cleaned -output /taxi_project/output/distance \
+  -mapper mapper_distance.py -reducer reducer_distance.py -numReduceTasks 1
+
+# (g) Busiest routes (composite key PU->DO)
+hadoop jar $STREAM_JAR -files mappers/mapper_route.py,reducers/reducer_route.py \
+  -input /taxi_project/input/cleaned -output /taxi_project/output/routes \
+  -mapper mapper_route.py -reducer reducer_route.py -numReduceTasks 2
+
+# (h) Trip duration bands
+hadoop jar $STREAM_JAR -files mappers/mapper_duration.py,reducers/reducer_duration.py \
+  -input /taxi_project/input/cleaned -output /taxi_project/output/duration \
+  -mapper mapper_duration.py -reducer reducer_duration.py -numReduceTasks 1
+
+# (i) Anomaly detection -- runs on RAW, so percentages are of the ORIGINAL dataset
+hadoop jar $STREAM_JAR -files mappers/mapper_anomaly.py,reducers/reducer_anomaly.py \
+  -input /taxi_project/input/raw -output /taxi_project/output/anomalies \
+  -mapper mapper_anomaly.py -reducer reducer_anomaly.py -numReduceTasks 1
+
+# -----------------------------------------------------------------------------
+# 8. MULTI-STAGE MAPREDUCE (COMPULSORY)
+# -----------------------------------------------------------------------------
+# Stage 2 reads Stage 1's HDFS OUTPUT as its input -- this is what makes it multi-stage.
+# Intermediate output (proof that stage 1 completed independently):
+hdfs dfs -cat /taxi_project/output/revenue/part-00000 | head -20
+
+# Single reducer: a global Top-N cannot be computed per-partition.
+hadoop jar $STREAM_JAR -files mappers/mapper_topn.py,reducers/reducer_topn.py \
+  -input  /taxi_project/output/revenue \
+  -output /taxi_project/output/top10_revenue \
+  -mapper mapper_topn.py -reducer reducer_topn.py -numReduceTasks 1
+
+hdfs dfs -cat /taxi_project/output/top10_revenue/part-00000
+
+# -----------------------------------------------------------------------------
+# 9. YARN EVIDENCE
+# -----------------------------------------------------------------------------
+yarn application -list -appStates ALL
+yarn application -status <APPLICATION_ID>
+yarn logs -applicationId <APPLICATION_ID> | head -100
+# Web UI: http://localhost:8088/cluster   (NameNode UI: http://localhost:9870)
+
+# -----------------------------------------------------------------------------
+# 10. PERFORMANCE COMPARISON (COMPULSORY)
+# -----------------------------------------------------------------------------
+python3 scripts/pandas_benchmark.py         # identical hourly analysis, single machine
+
+# -----------------------------------------------------------------------------
+# 11. RETRIEVE RESULTS AND BUILD CHARTS
+# -----------------------------------------------------------------------------
+for d in hourly daily locations revenue payment distance duration routes anomalies top10_revenue; do
+  hdfs dfs -cat /taxi_project/output/$d/part-* > output/local/$d.tsv
+done
+python3 scripts/make_visualizations.py
+
+# -----------------------------------------------------------------------------
+# 12. ARCHIVE
+# -----------------------------------------------------------------------------
+hdfs dfs -cp /taxi_project/output/revenue /taxi_project/archive/revenue_snapshot
+hdfs dfs -ls -R /taxi_project/archive
+
+# -----------------------------------------------------------------------------
+# 13. SHUTDOWN
+# -----------------------------------------------------------------------------
+stop-yarn.sh
+stop-dfs.sh
